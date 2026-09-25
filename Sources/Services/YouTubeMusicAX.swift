@@ -140,8 +140,10 @@ final class YouTubeMusicAX {
             snapshot.artist += text
         }
         if snapshot.title.isEmpty { return nil }
+        // During a track change the bar can briefly pair the old track's time
+        // with the new one's length; clamp so the playhead never jumps past the end.
         if let (position, duration) = scan.time {
-            snapshot.position = position
+            snapshot.position = min(position, duration)
             snapshot.duration = duration
         }
         if let progress = scan.progress, snapshot.duration > 0, snapshot.position == 0 {
