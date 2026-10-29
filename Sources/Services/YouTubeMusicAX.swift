@@ -22,6 +22,8 @@ final class YouTubeMusicAX {
         var position: Double = 0
         var duration: Double = 0
         var isPlaying = false
+        /// Nil when the bar shows no Like control (e.g. an ad).
+        var liked: Bool?
 
         var hasTrack: Bool { !title.isEmpty }
     }
@@ -40,6 +42,7 @@ final class YouTubeMusicAX {
     private var pid: pid_t = 0
     private var bar: AXUIElement?
     private var lastAttach = Date.distantPast
+    private var attachDelay: TimeInterval = 0
     private var lastNudge = Date.distantPast
     private var warmedUp = false
     /// Transport buttons seen on the last read, so a press never has to walk
@@ -47,7 +50,7 @@ final class YouTubeMusicAX {
     private var buttons: [String: AXUIElement] = [:]
 
     enum Control: String {
-        case play = "Play", pause = "Pause", next = "Next", previous = "Previous"
+        case play = "Play", pause = "Pause", next = "Next", previous = "Previous", like = "Like"
     }
 
     private init() {
@@ -112,19 +115,24 @@ final class YouTubeMusicAX {
             resetLocked()
             appElement = AXUIElementCreateApplication(app.processIdentifier)
             pid = app.processIdentifier
-            lastAttach = .distantPast
         }
         // A page rebuild leaves the cached bar stale; find the new one in the
         // same pass instead of reporting "nothing playing" for a poll.
         if let cached = bar, !isAlive(cached) {
             bar = nil
             buttons = [:]
-            lastAttach = .distantPast
+            attachDelay = 0
         }
-        if bar == nil, Date().timeIntervalSince(lastAttach) > 1.0 {
+        // Attaching walks thousands of elements, so while nothing is loaded
+        // (no window, or an empty player) the retries back off to every 8 s.
+        if bar == nil, Date().timeIntervalSince(lastAttach) > attachDelay {
             lastAttach = Date()
-            _ = attachLocked()
-            if bar != nil { warmedUp = true }
+            if attachLocked() {
+                warmedUp = true
+                attachDelay = 1
+            } else {
+                attachDelay = min(max(attachDelay * 2, 1), 8)
+            }
         }
         guard let bar else { return nil }
 
@@ -133,39 +141,39 @@ final class YouTubeMusicAX {
         buttons = scan.buttons
 
         var snapshot = Snapshot()
-        snapshot.title = scan.heading
-        for text in scan.texts where Self.parseTime(text) == nil {
-            if snapshot.title.isEmpty { snapshot.title = text; continue }
-            if text == snapshot.title { continue }
-            snapshot.artist += text
-        }
+        snapshot.title = scan.heading.isEmpty ? scan.texts.first(where: { Self.parseTime($0) == nil }) ?? "" : scan.heading
         if snapshot.title.isEmpty { return nil }
+        Self.parseByline(scan.byline, into: &snapshot)
+
+        // The time label is what the user sees; the seek slider (in seconds)
+        // covers the moments the label is missing during a page rebuild.
+        if let (position, duration) = scan.time, duration > 0 {
+            snapshot.duration = duration
+            snapshot.position = position
+        } else if let (value, maximum) = scan.seek, maximum > 0 {
+            snapshot.duration = maximum
+            snapshot.position = value
+        }
         // During a track change the bar can briefly pair the old track's time
         // with the new one's length; clamp so the playhead never jumps past the end.
-        if let (position, duration) = scan.time {
-            snapshot.position = min(position, duration)
-            snapshot.duration = duration
-        }
-        if let progress = scan.progress, snapshot.duration > 0, snapshot.position == 0 {
-            snapshot.position = progress * snapshot.duration
-        }
-        snapshot.isPlaying = scan.hasPause
-        Self.split(&snapshot)
+        snapshot.position = min(max(snapshot.position, 0), snapshot.duration)
+        snapshot.isPlaying = scan.pauses
+        snapshot.liked = scan.liked
         return snapshot
     }
 
+    /// Makes the next read retry attaching right away, e.g. when the panel opens.
+    func wake() { queue.async { self.attachDelay = 0 } }
+
     private struct Scan {
         var heading = ""
+        var byline = ""
         var texts: [String] = []
         var time: (Double, Double)?
-        var progress: Double?
-        var plays = false
+        var seek: (Double, Double)?
         var pauses = false
-        var nexts = false
-        var previouses = false
+        var liked: Bool?
         var buttons: [String: AXUIElement] = [:]
-
-        var hasPause: Bool { pauses }
     }
 
     private func collect(_ element: AXUIElement, _ depth: Int, _ scan: inout Scan) {
@@ -178,43 +186,59 @@ final class YouTubeMusicAX {
                 if let parsed = Self.parseTime(value) { scan.time = parsed }
             }
         case "AXHeading":
-            if scan.heading.isEmpty {
+            // The heading's value is its level ("2"), never the track name.
+            if scan.heading.isEmpty { scan.heading = Self.string(element, kAXTitleAttribute) }
+        case "AXGroup":
+            // "Artist • Album • Year" is published whole as the group's title.
+            if scan.byline.isEmpty {
                 let title = Self.string(element, kAXTitleAttribute)
-                let value = Self.string(element, kAXValueAttribute)
-                scan.heading = title.isEmpty ? value : title
+                if title.contains(" • ") {
+                    scan.byline = title
+                    return
+                }
             }
         case "AXProgressIndicator":
-            if scan.progress == nil, let number = Self.attribute(element, kAXValueAttribute) as? NSNumber {
-                scan.progress = number.doubleValue > 1 ? number.doubleValue / 100 : number.doubleValue
+            if scan.seek == nil, Self.string(element, kAXTitleAttribute) == "Seek slider",
+               let value = Self.attribute(element, kAXValueAttribute) as? NSNumber,
+               let maximum = Self.attribute(element, kAXMaxValueAttribute) as? NSNumber {
+                scan.seek = (value.doubleValue, maximum.doubleValue)
             }
+            return
         case "AXButton":
             let title = Self.string(element, kAXTitleAttribute)
             switch title {
             case "Play", "Pause", "Next", "Previous": scan.buttons[title] = element
             default: break
             }
-            switch title {
-            case "Play": scan.plays = true
-            case "Pause": scan.pauses = true
-            case "Next": scan.nexts = true
-            case "Previous": scan.previouses = true
-            default: break
+            if title == "Pause" { scan.pauses = true }
+            return
+        case "AXCheckBox":
+            if Self.string(element, kAXTitleAttribute) == "Like" {
+                scan.buttons["Like"] = element
+                scan.liked = (Self.attribute(element, kAXValueAttribute) as? NSNumber)?.boolValue ?? false
             }
+            return
         default:
             break
         }
         for child in Self.children(element) { collect(child, depth + 1, &scan) }
     }
 
-    /// The artist line arrives as "artist • album • year"; split it apart.
-    private static func split(_ snapshot: inout Snapshot) {
-        let parts = snapshot.artist
-            .components(separatedBy: " • ")
+    /// Songs read "artist • album • year"; videos read "artist • 1.2M views •
+    /// 30K likes", where the second part is not an album.
+    private static func parseByline(_ byline: String, into snapshot: inout Snapshot) {
+        let parts = byline
+            .components(separatedBy: "•")
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
-        guard !parts.isEmpty else { return }
-        snapshot.artist = parts[0]
-        if parts.count > 1 { snapshot.album = parts[1] }
+        guard let artist = parts.first else { return }
+        snapshot.artist = artist
+        if parts.count > 1 {
+            let second = parts[1]
+            let lowered = second.lowercased()
+            let isYear = second.count == 4 && Int(second) != nil
+            if !isYear, !lowered.hasSuffix("views"), !lowered.hasSuffix("likes") { snapshot.album = second }
+        }
     }
 
     private static func parseTime(_ text: String) -> (Double, Double)? {
@@ -270,7 +294,8 @@ final class YouTubeMusicAX {
     /// Finds a transport button by its accessibility title and presses it.
     private func press(in element: AXUIElement, titled title: String, depth: Int = 0) -> Bool {
         guard depth < 8 else { return false }
-        if Self.string(element, kAXRoleAttribute) == "AXButton",
+        let role = Self.string(element, kAXRoleAttribute)
+        if role == "AXButton" || role == "AXCheckBox",
            Self.string(element, kAXTitleAttribute) == title {
             return perform(element)
         }
@@ -289,6 +314,7 @@ final class YouTubeMusicAX {
         buttons = [:]
         warmedUp = false
         lastAttach = .distantPast
+        attachDelay = 0
         lastNudge = .distantPast
     }
 
