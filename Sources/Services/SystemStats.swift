@@ -179,7 +179,7 @@ final class BatteryReader {
 
 // MARK: - Processes
 
-struct TopProcess: Identifiable {
+struct TopProcess: Identifiable, Equatable {
     let pid: Int
     let name: String
     let memory: Double

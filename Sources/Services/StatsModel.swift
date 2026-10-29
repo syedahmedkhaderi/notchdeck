@@ -58,8 +58,9 @@ final class StatsModel: ObservableObject {
         processQueue.async { [weak self] in
             let top = ProcessReader.topByMemory(Self.topProcessCount)
             DispatchQueue.main.async {
-                self?.processBusy = false
-                self?.topMemory = top
+                guard let self else { return }
+                self.processBusy = false
+                if self.topMemory != top { self.topMemory = top }
             }
         }
     }

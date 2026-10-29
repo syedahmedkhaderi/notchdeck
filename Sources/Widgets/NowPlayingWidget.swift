@@ -17,6 +17,17 @@ struct NowPlayingWidget: View {
             HStack(alignment: .center, spacing: 12) {
                 artwork
                 trackInfo
+                if let liked = now.liked {
+                    Button(action: media.toggleLike) {
+                        Image(systemName: liked ? "heart.fill" : "heart")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(liked ? tint : Theme.textSecondary)
+                            .frame(width: 26, height: 26)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(HoverButtonStyle())
+                    .help(liked ? "Remove like" : "Like")
+                }
             }
             ScrubberView(media: media, tint: tint)
                 .padding(.top, 12)
@@ -54,6 +65,12 @@ struct NowPlayingWidget: View {
     }
 
     private var trackInfo: some View {
+        Button(action: media.openPlayer) { trackText }
+            .buttonStyle(.plain)
+            .help(now.hasTrack ? "Open \(now.sourceName)" : "Open YouTube Music")
+    }
+
+    private var trackText: some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 4) {
                 Image(systemName: now.source == .spotify ? "waveform" : "play.rectangle.fill")
@@ -77,6 +94,7 @@ struct NowPlayingWidget: View {
         }
         .lineLimit(1)
         .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
     }
 
     private var transport: some View {

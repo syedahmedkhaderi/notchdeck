@@ -33,7 +33,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
-        guard let screen = NSScreen.screens.first else { return }
+        guard let screen = Self.notchScreen() else { return }
         buildWindow(for: screen)
         installPointerMonitors()
         calendar.start()
@@ -43,7 +43,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            guard let self, let screen = NSScreen.screens.first else { return }
+            guard let self, let screen = Self.notchScreen() else { return }
             self.buildWindow(for: screen)
         }
 
@@ -68,6 +68,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     // MARK: Window
+
+    /// The built-in display with the camera housing, even when an external
+    /// monitor is the main screen; otherwise the menu-bar screen.
+    private static func notchScreen() -> NSScreen? {
+        NSScreen.screens.first { $0.auxiliaryTopLeftArea != nil } ?? NSScreen.screens.first
+    }
 
     private func buildWindow(for screen: NSScreen) {
         let root = PanelRootView(

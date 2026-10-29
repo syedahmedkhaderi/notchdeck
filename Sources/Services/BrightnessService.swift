@@ -232,7 +232,8 @@ final class BrightnessService: ObservableObject {
             let builtinResult = builtin
             DispatchQueue.main.async {
                 self.scanning = false
-                self.displays = builtinResult + result
+                let displays = builtinResult + result
+                if self.displays != displays { self.displays = displays }
             }
         }
     }

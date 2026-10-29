@@ -25,6 +25,8 @@ struct NowPlaying {
     /// Dominant colour of the artwork, computed once per cover.
     var tint: NSColor?
     var source: MediaSource = .youtubeMusic
+    /// YouTube Music's Like state; nil when the player shows no Like control.
+    var liked: Bool?
 
     var hasTrack: Bool { !title.isEmpty }
     var sourceName: String { source.name }
@@ -34,7 +36,7 @@ struct NowPlaying {
     func sameDisplay(as other: NowPlaying) -> Bool {
         title == other.title && artist == other.artist && album == other.album
             && isPlaying == other.isPlaying && duration == other.duration
-            && artwork === other.artwork && source == other.source
+            && artwork === other.artwork && source == other.source && liked == other.liked
     }
 }
 
@@ -51,24 +53,32 @@ final class MediaService: ObservableObject {
     @Published private(set) var needsPermission = false
 
     private var timer: Timer?
-    /// While the panel is warming up (or right after a launch) the player is
-    /// polled faster, because Chrome only publishes its accessibility tree after
-    /// a few rounds of queries.
+    /// After a command (or while the player is still attaching) the player is
+    /// polled faster so the new state lands quickly.
     private var fastUntil = Date.distantPast
     private var sampledAt = Date()
     private var elapsedAtSample: Double = 0
     private var rate: Double = 0
     private var artworkKey = ""
+    private var spotifyArtworkInFlight = ""
     private var busy = false
     /// A refresh was asked for while a poll was in flight; run it straight after.
     private var refreshPending = false
     private var launchToken = 0
     private var lastCommand = Date.distantPast
-    /// Polls that started before this moment (plus Chrome's lag) can't have
-    /// seen the last command yet, so their play state is ignored.
-    private var commandAt = Date.distantPast
+    /// Chrome takes a beat to flip its buttons after a press. Until a poll
+    /// confirms the state the user asked for (or this deadline passes), polls
+    /// that still show the old state are overridden instead of flickering back.
+    private var expectedPlaying: Bool?
+    private var expectedLiked: Bool?
+    private var expectedUntil = Date.distantPast
+    /// Title of the track a skip left. Until the player shows a new track, polls
+    /// still carrying the old one (and its old playhead) are ignored.
+    private var skippingFrom: String?
+    private var skipUntil = Date.distantPast
     private var lastGoodRead = Date.distantPast
     private var active = false
+    private var spotifyObserver: NSObjectProtocol?
 
     private let queue = DispatchQueue(label: "notchdeck.media", qos: .userInitiated)
 
@@ -79,26 +89,34 @@ final class MediaService: ObservableObject {
     func start() {
         guard !active else { return }
         active = true
-        pollSoon(after: 0, fast: true)
+        YouTubeMusicAX.shared.wake()
+        fastUntil = Date().addingTimeInterval(3)
+        // Spotify announces every change itself, so it never has to be polled fast.
+        spotifyObserver = DistributedNotificationCenter.default().addObserver(
+            forName: Notification.Name("com.spotify.client.PlaybackStateChanged"), object: nil, queue: .main
+        ) { [weak self] _ in self?.refresh() }
+        pollSoon(after: 0)
     }
 
     func stop() {
         active = false
         timer?.invalidate()
         timer = nil
+        if let spotifyObserver { DistributedNotificationCenter.default().removeObserver(spotifyObserver) }
+        spotifyObserver = nil
     }
 
-    /// One self-rescheduling timer: quick while the panel is settling, then a
-    /// steady once-a-second tick.
-    private func pollSoon(after delay: Double, fast: Bool = false) {
+    /// One self-rescheduling timer: quick right after a command, then a steady
+    /// once-a-second tick (each read is a few milliseconds of AX traffic).
+    private func pollSoon(after delay: Double) {
         guard active else { return }
         timer?.invalidate()
-        if fast { fastUntil = Date().addingTimeInterval(8) }
         let t = Timer(timeInterval: delay, repeats: false) { [weak self] _ in
             guard let self else { return }
             self.refresh()
-            self.pollSoon(after: Date() < self.fastUntil ? 0.35 : 1.5)
+            self.pollSoon(after: Date() < self.fastUntil ? 0.3 : 1.0)
         }
+        t.tolerance = delay * 0.1
         RunLoop.main.add(t, forMode: .common)
         timer = t
     }
@@ -111,11 +129,9 @@ final class MediaService: ObservableObject {
             return
         }
         busy = true
-        let startedAt = Date()
         queue.async { [weak self] in
             guard let self else { return }
-            var snapshot = self.probe()
-            snapshot.startedAt = startedAt
+            let snapshot = self.probe()
             DispatchQueue.main.async {
                 self.busy = false
                 self.apply(snapshot)
@@ -131,84 +147,63 @@ final class MediaService: ObservableObject {
         var youtube: YouTubeMusicAX.Snapshot?
         var spotify: SpotifyController.Snapshot?
         var trusted = true
-        var startedAt = Date()
+        var youtubeRunning = false
     }
 
-    /// Reads both players. YouTube Music only exposes a tree while it runs, and
-    /// Spotify only while its process is up, so an idle panel does almost no work.
+    /// Reads both players. Each reader answers nil straight away when its app
+    /// is not running, so an idle player costs almost nothing.
     private func probe() -> Probe {
         var result = Probe()
         result.trusted = YouTubeMusicAX.isTrusted
-        // Both readers already answer nil when their app is not running, so a
-        // single call each keeps the poll cheap.
+        result.youtubeRunning = YouTubeMusicAX.isAppRunning
         result.youtube = YouTubeMusicAX.shared.read()
         result.spotify = SpotifyController.shared.read()
         return result
     }
 
     private func apply(_ probe: Probe) {
-        let youtubeRunning = YouTubeMusicAX.isAppRunning
-        needsPermission = !probe.trusted && youtubeRunning
+        let permission = !probe.trusted && probe.youtubeRunning
+        if needsPermission != permission { needsPermission = permission }
 
         // Chrome drops its tree for a moment when it rebuilds the page. One
         // empty read while the app is still up is not "nothing playing".
-        if probe.youtube == nil, probe.spotify == nil, youtubeRunning, now.hasTrack,
+        if probe.youtube == nil, probe.spotify == nil, probe.youtubeRunning, now.hasTrack,
            Date().timeIntervalSince(lastGoodRead) < 4 {
             return
         }
         if probe.youtube != nil || probe.spotify != nil { lastGoodRead = Date() }
 
-        let youtube = probe.youtube
-        let spotify = probe.spotify
+        var track = Self.pick(youtube: probe.youtube, spotify: probe.spotify)
 
-        // Whichever player is actually running the audio wins; a paused YouTube
-        // Music still beats a paused Spotify because it is the panel's default.
-        let source: MediaSource
-        var track = NowPlaying()
-        if let youtube, youtube.isPlaying {
-            source = .youtubeMusic
-            track.title = youtube.title
-            track.artist = youtube.artist
-            track.album = youtube.album
-            track.duration = youtube.duration
-            track.position = youtube.position
-            track.isPlaying = true
-        } else if let spotify, spotify.isPlaying {
-            source = .spotify
-            track.title = spotify.title
-            track.artist = spotify.artist
-            track.album = spotify.album
-            track.duration = spotify.duration
-            track.position = spotify.position
-            track.isPlaying = true
-        } else if let youtube {
-            source = .youtubeMusic
-            track.title = youtube.title
-            track.artist = youtube.artist
-            track.album = youtube.album
-            track.duration = youtube.duration
-            track.position = youtube.position
-            track.isPlaying = false
-        } else if let spotify {
-            source = .spotify
-            track.title = spotify.title
-            track.artist = spotify.artist
-            track.album = spotify.album
-            track.duration = spotify.duration
-            track.position = spotify.position
-            track.isPlaying = false
+        // Right after a skip the bar still shows the old track for a moment;
+        // showing it would throw the playhead back to where the old song was.
+        // "Previous" early in a track restarts it, which reads as a playhead near 0.
+        if let from = skippingFrom {
+            if Date() < skipUntil, track.title == from, track.position > 3 { return }
+            skippingFrom = nil
+        }
+
+        let sameTrack = track.hasTrack && track.title == now.title && track.source == now.source
+        if Date() < expectedUntil, sameTrack {
+            if let expected = expectedPlaying {
+                if track.isPlaying == expected {
+                    expectedPlaying = nil
+                } else {
+                    track.isPlaying = expected
+                    track.position = livePosition()
+                }
+            }
+            if let expected = expectedLiked {
+                if track.liked == expected { expectedLiked = nil } else { track.liked = expected }
+            }
         } else {
-            source = .youtubeMusic
+            expectedPlaying = nil
+            expectedLiked = nil
         }
 
-        track.source = source
-        // A poll that began before the last click (Chrome needs a beat to
-        // update the button) would flip the icon back; keep the optimistic state.
-        if track.hasTrack, track.title == now.title, track.source == now.source,
-           probe.startedAt < commandAt.addingTimeInterval(0.8) {
-            track.isPlaying = now.isPlaying
-            track.position = livePosition()
-        }
+        // A seek done in the player itself moves the playhead without changing
+        // anything else, so drift is a reason to publish too.
+        let drifted = track.hasTrack && abs(track.position - livePosition()) > 1.5
         if track.hasTrack {
             sampledAt = Date()
             elapsedAtSample = track.position
@@ -216,8 +211,33 @@ final class MediaService: ObservableObject {
         } else {
             rate = 0
         }
-        resolveArtwork(&track, spotify: source == .spotify ? spotify : nil)
-        if !track.sameDisplay(as: now) { now = track }
+        resolveArtwork(&track, spotify: track.source == .spotify ? probe.spotify : nil)
+        if drifted || !track.sameDisplay(as: now) { now = track }
+    }
+
+    /// Whichever player is actually running the audio wins; a paused YouTube
+    /// Music still beats a paused Spotify because it is the panel's default.
+    private static func pick(youtube: YouTubeMusicAX.Snapshot?, spotify: SpotifyController.Snapshot?) -> NowPlaying {
+        var track = NowPlaying()
+        if let youtube, youtube.isPlaying || !(spotify?.isPlaying ?? false) {
+            track.source = .youtubeMusic
+            track.title = youtube.title
+            track.artist = youtube.artist
+            track.album = youtube.album
+            track.duration = youtube.duration
+            track.position = youtube.position
+            track.isPlaying = youtube.isPlaying
+            track.liked = youtube.liked
+        } else if let spotify {
+            track.source = .spotify
+            track.title = spotify.title
+            track.artist = spotify.artist
+            track.album = spotify.album
+            track.duration = spotify.duration
+            track.position = spotify.position
+            track.isPlaying = spotify.isPlaying
+        }
+        return track
     }
 
     // MARK: Artwork
@@ -240,10 +260,15 @@ final class MediaService: ObservableObject {
             return
         }
         if let url = spotify?.artworkURL {
+            // Downloads share the queue that sends play/pause, so only one at a time.
+            guard spotifyArtworkInFlight != key else { return }
+            spotifyArtworkInFlight = key
             queue.async { [weak self] in
                 let image = SpotifyController.shared.artwork(from: url)
                 DispatchQueue.main.async {
-                    guard let self, let image, self.artworkKey == key else { return }
+                    guard let self else { return }
+                    self.spotifyArtworkInFlight = ""
+                    guard let image, self.artworkKey == key else { return }
                     self.now.artwork = image
                     self.now.tint = Self.dominantColor(of: image)
                 }
@@ -303,7 +328,13 @@ final class MediaService: ObservableObject {
                 if !ok { MediaRemote.shared.send(wasPlaying ? .pause : .play) }
             }
         }
-        optimisticallyToggle()
+        let position = livePosition()
+        now.isPlaying = !wasPlaying
+        sampledAt = Date()
+        elapsedAtSample = position
+        rate = now.isPlaying ? 1 : 0
+        expectedPlaying = now.isPlaying
+        expectedUntil = Date().addingTimeInterval(2)
         confirmSoon()
     }
 
@@ -323,9 +354,33 @@ final class MediaService: ObservableObject {
             }
         }
         // Restart the playhead right away so the skip feels instant.
+        skippingFrom = now.title
+        skipUntil = Date().addingTimeInterval(3)
+        expectedPlaying = nil
         sampledAt = Date()
         elapsedAtSample = 0
+        now.position = 0
         confirmSoon()
+    }
+
+    /// Likes or un-likes the current YouTube Music track.
+    func toggleLike() {
+        guard acceptCommand(), now.hasTrack, now.source == .youtubeMusic, let liked = now.liked else { return }
+        YouTubeMusicAX.shared.press(.like)
+        now.liked = !liked
+        expectedLiked = !liked
+        expectedUntil = Date().addingTimeInterval(2)
+        confirmSoon()
+    }
+
+    /// Brings the playing app to the front.
+    func openPlayer() {
+        if now.source == .spotify, now.hasTrack,
+           let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: SpotifyController.bundleID) {
+            NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration()) { _, _ in }
+        } else {
+            YouTubeMusicAX.open()
+        }
     }
 
     /// Swallows only a genuine double-fire of the same click.
@@ -333,26 +388,16 @@ final class MediaService: ObservableObject {
         let now = Date()
         guard now.timeIntervalSince(lastCommand) > 0.25 else { return false }
         lastCommand = now
-        commandAt = now
         return true
-    }
-
-    /// Flips the panel's own state the instant the button is pressed.
-    private func optimisticallyToggle() {
-        let position = livePosition()
-        now.isPlaying.toggle()
-        sampledAt = Date()
-        elapsedAtSample = position
-        rate = now.isPlaying ? 1 : 0
     }
 
     /// Polls quickly for a couple of seconds so the new state or track lands fast.
     private func confirmSoon() {
         fastUntil = Date().addingTimeInterval(2.5)
         if active {
-            pollSoon(after: 0.4)
+            pollSoon(after: 0.3)
         } else {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in self?.refresh() }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in self?.refresh() }
         }
     }
 
@@ -367,6 +412,7 @@ final class MediaService: ObservableObject {
         let token = launchToken
 
         YouTubeMusicAX.open()
+        YouTubeMusicAX.shared.wake()
         fastUntil = Date().addingTimeInterval(30)
         if !YouTubeMusicAX.isTrusted { YouTubeMusicAX.requestTrust() }
         attemptLaunch(token: token, count: 0)

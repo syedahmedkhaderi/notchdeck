@@ -3,7 +3,7 @@ import Combine
 import EventKit
 import Foundation
 
-struct CalendarEvent: Identifiable {
+struct CalendarEvent: Identifiable, Equatable {
     let id: String
     let title: String
     let start: Date
@@ -31,6 +31,8 @@ final class CalendarService: ObservableObject {
             timer = nil
             return
         }
+        // Access may have been granted in System Settings since launch.
+        if !authorized, EKEventStore.authorizationStatus(for: .event) == .fullAccess { authorized = true }
         reload()
         guard timer == nil else { return }
         let t = Timer(timeInterval: 60, repeats: true) { [weak self] _ in self?.reload() }
@@ -73,10 +75,14 @@ final class CalendarService: ObservableObject {
         guard let end = cal.date(byAdding: .day, value: 1, to: start) else { return }
         let predicate = store.predicateForEvents(withStart: start, end: end, calendars: nil)
         let matches: [EKEvent] = store.events(matching: predicate)
-        let sorted = matches.sorted { $0.startDate < $1.startDate }
-        today = sorted.map { event in
+        // Finished events drop off so the two visible rows are what's next.
+        let now = Date()
+        let sorted = matches
+            .filter { $0.isAllDay || $0.endDate > now }
+            .sorted { $0.startDate < $1.startDate }
+        let events = sorted.map { event in
             CalendarEvent(
-                id: event.eventIdentifier ?? UUID().uuidString,
+                id: event.eventIdentifier ?? "\(event.title ?? "")|\(event.startDate.timeIntervalSince1970)",
                 title: event.title ?? "Untitled",
                 start: event.startDate,
                 end: event.endDate,
@@ -84,6 +90,7 @@ final class CalendarService: ObservableObject {
                 calendarColor: event.calendar?.color ?? NSColor.systemTeal
             )
         }
+        if events != today { today = events }
     }
 
     private static let dayLabel: DateFormatter = {
