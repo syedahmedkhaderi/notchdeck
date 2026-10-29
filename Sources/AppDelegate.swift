@@ -9,6 +9,7 @@ final class PanelHostingView<Content: View>: NSHostingView<Content> {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var panel: NotchPanel!
+    private var trigger: NSPanel?
     private var geometry: NotchGeometry!
 
     private let state = PanelState()
@@ -35,7 +36,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.accessory)
         guard let screen = Self.notchScreen() else { return }
         buildWindow(for: screen)
-        installPointerMonitors()
         calendar.start()
 
         screenObserver = NotificationCenter.default.addObserver(
@@ -112,8 +112,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             panel = newPanel
         }
         panel.contentView = hosting
+        if trigger == nil, !previewMode { trigger = makeTrigger() }
         layout(screen: screen)
         panel.orderFrontRegardless()
+        trigger?.orderFrontRegardless()
+    }
+
+    /// One level below the panel, so the open panel always takes the clicks.
+    private func makeTrigger() -> NSPanel {
+        let window = NSPanel(
+            contentRect: .zero,
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        window.level = NSWindow.Level(rawValue: 26)
+        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+        window.isOpaque = false
+        // A fully clear window lets the pointer fall through to the menu bar;
+        // a near-zero alpha keeps the tracking area live and is invisible.
+        window.backgroundColor = NSColor.black.withAlphaComponent(0.002)
+        window.hasShadow = false
+        window.isMovable = false
+        window.hidesOnDeactivate = false
+        window.ignoresMouseEvents = false
+        window.animationBehavior = .none
+        window.isReleasedWhenClosed = false
+        let view = NotchTriggerView()
+        view.onEnter = { [weak self] in self?.expand() }
+        window.contentView = view
+        return window
     }
 
     /// Sizes the window to the visible widgets. Geometry, hit areas and the
@@ -132,6 +160,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         state.headerHeight = geometry.headerHeight
         state.notchSize = geometry.notchSize
         panel.setFrame(geometry.windowFrame, display: true)
+        trigger?.setFrame(geometry.openRect.intersection(screen.frame), display: false)
     }
 
     /// Only the services behind visible widgets run, and only while the panel
@@ -167,7 +196,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: Pointer handling
 
-    private func installPointerMonitors() {
+    /// Only installed while the panel is open: the closed notch is watched by
+    /// the trigger window's tracking area instead.
+    private func setPointerMonitors(active: Bool) {
+        guard !previewMode else { return }
+        guard active else {
+            if let monitor = globalMonitor { NSEvent.removeMonitor(monitor) }
+            if let monitor = localMonitor { NSEvent.removeMonitor(monitor) }
+            globalMonitor = nil
+            localMonitor = nil
+            return
+        }
+        guard globalMonitor == nil else { return }
         globalMonitor = NSEvent.addGlobalMonitorForEvents(
             matching: [.mouseMoved, .leftMouseDragged, .leftMouseDown]
         ) { [weak self] event in
@@ -218,6 +258,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         collapseWork = nil
         guard !state.expanded else { return }
         panel.ignoresMouseEvents = false
+        setPointerMonitors(active: true)
         setSampling(active: true)
         withAnimation(.spring(response: 0.3, dampingFraction: 0.82)) { state.expanded = true }
     }
@@ -227,6 +268,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         collapseWork?.cancel()
         collapseWork = nil
         panel.ignoresMouseEvents = true
+        setPointerMonitors(active: false)
         setSampling(active: false)
         withAnimation(.easeIn(duration: 0.14)) { state.expanded = false }
         if state.arranging {
